@@ -23,6 +23,12 @@ type Applier interface {
 	// The engine uses this to distinguish a real no-op from a resource
 	// that must be (re)created after a failed attempt or a crash.
 	Exists(key string) bool
+	// Get returns the backend's current live declaration for key, or
+	// false when the object is absent. The engine compares this ground
+	// truth against the desired declaration on every reconcile so that
+	// external drift (out-of-band modification) and writes that never
+	// took effect are detected instead of trusting local records.
+	Get(key string) (v1.Declaration, bool)
 	// APIVersion reports the backend API version, used for compatibility
 	// checks against AnnotationMinApplierVersion.
 	APIVersion() string

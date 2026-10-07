@@ -67,6 +67,12 @@ func (f *FakeApplier) GetDeclaration(key string) (v1.Declaration, bool) {
 	return d, ok
 }
 
+// Get implements the Applier live-read contract: it returns the backend
+// world's own truth for key, independent of any controller-side record.
+func (f *FakeApplier) Get(key string) (v1.Declaration, bool) {
+	return f.GetDeclaration(key)
+}
+
 // SeedWorld installs a resource directly into the backend, simulating a
 // resource created outside (or by a previous incarnation of) the
 // controller. Useful for ownership and process-restart tests.

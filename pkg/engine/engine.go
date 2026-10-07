@@ -252,6 +252,14 @@ func (e *Engine) Reconcile(ctx context.Context, generation int64, decls []v1.Dec
 
 // applyOne reconciles one desired resource. It returns the action performed
 // ("create", "update" or "noop") and a structured failure (nil on success).
+//
+// The backend's live state — not the local record — is the source of truth
+// for the satisfied/drifted decision: the desired hash is compared against
+// the hash of what the backend actually holds right now. This makes the
+// loop self-healing against out-of-band modification (drift -> update),
+// out-of-band deletion (missing -> create) and writes that never took
+// effect (a prior failed apply is retried until it truly lands), while a
+// backend that already matches is never rewritten (idempotent no-op).
 func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Resource, d v1.Declaration) (string, *v1.ReconcileError) {
 	key := d.Key()
 
@@ -267,7 +275,7 @@ func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Re
 	}
 
 	hash := d.SpecHash()
-	backendExists := e.applier.Exists(key)
+	backendDecl, backendExists := e.applier.Get(key)
 
 	// Externally owned object: refuse an over-privileged modification.
 	if existing != nil && existing.Owner != "" && existing.Owner != v1.ControllerOwner && !e.opts.Force {
@@ -288,10 +296,12 @@ func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Re
 	}
 
 	switch {
-	case existing == nil || !backendExists:
-		// Create (also recreates an object lost after a prior failed apply).
-		e.log.Printf("[apply] CREATE gen=%d resource=%s backendExists=%t storedExists=%t basis=missing",
-			generation, key, backendExists, existing != nil)
+	case existing == nil:
+		// Never managed by this controller: create. (An object the backend
+		// already holds but we have no record of is not adopted blindly —
+		// Create will surface the conflict as a traceable failure.)
+		e.log.Printf("[apply] CREATE gen=%d resource=%s backendExists=%t basis=no-local-record",
+			generation, key, backendExists)
 		if err := e.applier.Create(ctx, d); err != nil {
 			re := &v1.ReconcileError{Resource: key, Reason: v1.ReasonApplyFailed, Message: err.Error()}
 			e.markFailed(generation, d, re)
@@ -300,14 +310,40 @@ func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Re
 		e.recordReady(generation, d, hash)
 		return "create", nil
 
-	case hash == existing.SpecHash:
-		// Idempotent convergence: desired state already satisfied; do not
-		// rewrite it and perform no side effect.
-		e.log.Printf("[apply] NOOP gen=%d resource=%s basis=spec-hash-equal hash=%s", generation, key, shortHash(hash))
-		return "noop", nil
+	case !backendExists:
+		// Local record exists but the backend object is gone: it was lost
+		// after a failed apply/crash or deleted out-of-band. Recreate it.
+		e.log.Printf("[apply] CREATE gen=%d resource=%s storedPhase=%s basis=backend-missing (lost or externally deleted)",
+			generation, key, existing.Phase)
+		if err := e.applier.Create(ctx, d); err != nil {
+			re := &v1.ReconcileError{Resource: key, Reason: v1.ReasonApplyFailed, Message: err.Error()}
+			e.markFailed(generation, d, re)
+			return "", re
+		}
+		e.recordReady(generation, d, hash)
+		return "create", nil
 
 	default:
-		// Protected object: refuse an unforced content change.
+		backendHash := backendDecl.SpecHash()
+		if backendHash == hash {
+			// Idempotent convergence: the backend already holds exactly the
+			// desired state; perform no side effect. If the local record
+			// disagrees (e.g. a crash between apply and persist, or a
+			// failure recorded for a write that actually landed), repair
+			// the record store-only so future rounds stay quiet.
+			e.log.Printf("[apply] NOOP gen=%d resource=%s basis=backend-matches-desired hash=%s storedPhase=%s",
+				generation, key, shortHash(hash), existing.Phase)
+			if existing.Phase != v1.PhaseReady || existing.SpecHash != hash {
+				e.log.Printf("[apply] REPAIR-RECORD gen=%d resource=%s basis=local-record-stale storedPhase=%s storedHash=%s",
+					generation, key, existing.Phase, shortHash(existing.SpecHash))
+				e.recordReady(generation, d, hash)
+			}
+			return "noop", nil
+		}
+
+		// The backend content differs from the desired declaration. This
+		// covers desired-state changes, external drift and prior writes
+		// that never took effect — all converge through one update.
 		if isProtected(existing) && !e.opts.Force {
 			return "", e.guardReject(generation, key, &v1.ReconcileError{
 				Resource: key,
@@ -315,8 +351,8 @@ func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Re
 				Message:  "resource is protected; refusing in-place modification without force",
 			})
 		}
-		e.log.Printf("[apply] UPDATE gen=%d resource=%s oldHash=%s newHash=%s basis=spec-drift",
-			generation, key, shortHash(existing.SpecHash), shortHash(hash))
+		e.log.Printf("[apply] UPDATE gen=%d resource=%s desiredHash=%s backendHash=%s storedHash=%s basis=backend-differs-from-desired",
+			generation, key, shortHash(hash), shortHash(backendHash), shortHash(existing.SpecHash))
 		if err := e.applier.Update(ctx, existing, d); err != nil {
 			re := &v1.ReconcileError{Resource: key, Reason: v1.ReasonApplyFailed, Message: err.Error()}
 			e.markFailed(generation, d, re)
