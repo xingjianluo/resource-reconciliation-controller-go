@@ -1,9 +1,12 @@
 // Package engine implements the reconciliation loop: it validates the
-// desired set, orders create/update/delete work by dependency waves,
+// desired set, orders create/update/delete work by dependency waves, and
 // converges idempotently (no duplicate side effects, no no-op rewrites,
-// stale generations rejected), enforces protection/compatibility/ownership
-// rules with an auditable trail, and recovers after partial failure or
-// process restart from durable state.
+// stale generations rejected) with the BACKEND LIVE STATE as the sole
+// source of truth — every pass re-observes each resource and therefore
+// self-heals external mutation/deletion and retries writes that never
+// actually landed, including across process restarts. It enforces
+// protection/compatibility/ownership rules with an auditable trail and
+// recovers after partial failure or restart from durable state.
 package engine
 
 import (
@@ -250,10 +253,22 @@ func (e *Engine) Reconcile(ctx context.Context, generation int64, decls []v1.Dec
 	return result, nil
 }
 
-// applyOne reconciles one desired resource. It returns the action performed
-// ("create", "update" or "noop") and a structured failure (nil on success).
+// applyOne reconciles one desired resource against the BACKEND's live
+// state, which is the sole source of truth: the durable store is only
+// bookkeeping. It returns the action performed ("create", "update" or
+// "noop" — noop covers both an already-satisfied object and a side-effect
+// free adoption of a live object) and a structured failure (nil on
+// success).
+//
+// Because satisfaction is decided by observing the backend on every pass,
+// this detects (a) external mutation (live content differs from the
+// declaration -> one corrective update), (b) external deletion (live
+// object absent -> recreate), and (c) a write that previously failed or
+// never landed (live content still old -> retried). A previously recorded
+// Ready/Failed phase can never cause a satisfied verdict by itself.
 func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Resource, d v1.Declaration) (string, *v1.ReconcileError) {
 	key := d.Key()
+	hash := d.SpecHash()
 
 	// Guard: minimum backend API version (applies to create and update).
 	if min := d.Annotations[v1.AnnotationMinApplierVersion]; min != "" {
@@ -266,18 +281,6 @@ func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Re
 		}
 	}
 
-	hash := d.SpecHash()
-	backendExists := e.applier.Exists(key)
-
-	// Externally owned object: refuse an over-privileged modification.
-	if existing != nil && existing.Owner != "" && existing.Owner != v1.ControllerOwner && !e.opts.Force {
-		return "", e.guardReject(generation, key, &v1.ReconcileError{
-			Resource: key,
-			Reason:   v1.ReasonProtectedOwnership,
-			Message:  fmt.Sprintf("owned by %q, not %q", existing.Owner, v1.ControllerOwner),
-		})
-	}
-
 	// Stale declaration version cannot overwrite a newer effective one.
 	if existing != nil && existing.Version != "" && compareVersion(d.Version, existing.Version) < 0 {
 		return "", e.guardReject(generation, key, &v1.ReconcileError{
@@ -287,39 +290,98 @@ func (e *Engine) applyOne(ctx context.Context, generation int64, existing *v1.Re
 		})
 	}
 
+	// Observe the backend's live state. When the backend cannot be
+	// observed the resource MUST stay un-satisfied: we cannot claim
+	// success from local memory, and a later pass keeps retrying.
+	live, liveExists, getErr := e.applier.Get(ctx, key)
+	if getErr != nil {
+		re := &v1.ReconcileError{
+			Resource: key,
+			Reason:   v1.ReasonBackendUnavailable,
+			Message:  "cannot observe backend live state: " + getErr.Error(),
+		}
+		e.log.Printf("[observe] GET gen=%d resource=%s basis=backend-unavailable err=%q storedPhase=%s",
+			generation, key, getErr.Error(), phaseOf(existing))
+		e.markFailed(generation, d, existing, re)
+		return "", re
+	}
+	liveHash := live.SpecHash()
+	e.log.Printf("[observe] GET gen=%d resource=%s basis=live-truth liveExists=%t liveHash=%s desiredHash=%s storedPhase=%s storedHash=%s",
+		generation, key, liveExists, shortHash(liveHash), shortHash(hash), phaseOf(existing), shortHash(hashOf(existing)))
+
+	// Externally owned object: refuse an over-privileged modification.
+	// Ownership is read from the live backend object; the stored owner is
+	// only a fallback when the live annotations carry none. A stored
+	// foreign owner whose object has been deleted does not block recreate.
+	if liveExists && !e.opts.Force {
+		owner := live.Annotations[v1.AnnotationOwner]
+		if owner == "" && existing != nil {
+			owner = existing.Owner
+		}
+		if owner != "" && owner != v1.ControllerOwner {
+			return "", e.guardReject(generation, key, &v1.ReconcileError{
+				Resource: key,
+				Reason:   v1.ReasonProtectedOwnership,
+				Message:  fmt.Sprintf("owned by %q, not %q", owner, v1.ControllerOwner),
+			})
+		}
+	}
+
 	switch {
-	case existing == nil || !backendExists:
-		// Create (also recreates an object lost after a prior failed apply).
-		e.log.Printf("[apply] CREATE gen=%d resource=%s backendExists=%t storedExists=%t basis=missing",
-			generation, key, backendExists, existing != nil)
+	case !liveExists:
+		// Missing in the backend: never created, lost after a failed
+		// attempt/crash, or externally deleted. (Re)create regardless of
+		// what the local store remembers (it may wrongly say Ready).
+		e.log.Printf("[apply] CREATE gen=%d resource=%s basis=backend-missing storedExists=%t storedPhase=%s",
+			generation, key, existing != nil, phaseOf(existing))
 		if err := e.applier.Create(ctx, d); err != nil {
 			re := &v1.ReconcileError{Resource: key, Reason: v1.ReasonApplyFailed, Message: err.Error()}
-			e.markFailed(generation, d, re)
+			e.markFailed(generation, d, existing, re)
 			return "", re
 		}
 		e.recordReady(generation, d, hash)
 		return "create", nil
 
-	case hash == existing.SpecHash:
-		// Idempotent convergence: desired state already satisfied; do not
-		// rewrite it and perform no side effect.
-		e.log.Printf("[apply] NOOP gen=%d resource=%s basis=spec-hash-equal hash=%s", generation, key, shortHash(hash))
+	case liveHash == hash:
+		// The live backend content already equals the declaration. This is
+		// the ONLY satisfied verdict; it comes from observation, not from
+		// the stored phase. If local bookkeeping disagrees (a prior Failed
+		// mark, or a crash after the write landed), repair it WITHOUT any
+		// backend side effect.
+		if existing == nil || existing.Phase != v1.PhaseReady || existing.SpecHash != hash {
+			e.log.Printf("[apply] ADOPT gen=%d resource=%s basis=live-hash-equal hash=%s storedPhase=%s (no backend write)",
+				generation, key, shortHash(hash), phaseOf(existing))
+			e.recordReadyAction(generation, d, hash, "adopt",
+				"live backend state matches declaration; adopted without side effect")
+		} else {
+			e.log.Printf("[apply] NOOP gen=%d resource=%s basis=live-hash-equal hash=%s", generation, key, shortHash(hash))
+		}
 		return "noop", nil
 
 	default:
-		// Protected object: refuse an unforced content change.
-		if isProtected(existing) && !e.opts.Force {
+		// Live content differs from the declaration: external drift, or a
+		// previous create/update never actually landed. Exactly one
+		// corrective update converges it.
+		protected := (existing != nil && isProtected(existing)) ||
+			live.Annotations[v1.AnnotationProtected] == "true"
+		if protected && !e.opts.Force {
 			return "", e.guardReject(generation, key, &v1.ReconcileError{
 				Resource: key,
 				Reason:   v1.ReasonRuleConflict,
 				Message:  "resource is protected; refusing in-place modification without force",
 			})
 		}
-		e.log.Printf("[apply] UPDATE gen=%d resource=%s oldHash=%s newHash=%s basis=spec-drift",
-			generation, key, shortHash(existing.SpecHash), shortHash(hash))
-		if err := e.applier.Update(ctx, existing, d); err != nil {
+		e.log.Printf("[apply] UPDATE gen=%d resource=%s basis=external-drift liveHash=%s desiredHash=%s storedHash=%s",
+			generation, key, shortHash(liveHash), shortHash(hash), shortHash(hashOf(existing)))
+		eff := existing
+		if eff == nil {
+			// Live object exists but the store lost it (crash/adoption):
+			// give the applier the observed object as its base.
+			eff = resourceFromDecl(live)
+		}
+		if err := e.applier.Update(ctx, eff, d); err != nil {
 			re := &v1.ReconcileError{Resource: key, Reason: v1.ReasonApplyFailed, Message: err.Error()}
-			e.markFailed(generation, d, re)
+			e.markFailed(generation, d, existing, re)
 			return "", re
 		}
 		e.recordReady(generation, d, hash)
@@ -365,8 +427,16 @@ func (e *Engine) deleteOne(ctx context.Context, generation int64, r *v1.Resource
 	return nil
 }
 
-// recordReady persists the converged state and audits the side effect.
+// recordReady persists the converged state and audits the real side effect
+// ("create"/"update") that produced it.
 func (e *Engine) recordReady(generation int64, d v1.Declaration, hash string) {
+	e.recordReadyAction(generation, d, hash, "reconciled", "converged to desired state")
+}
+
+// recordReadyAction persists Ready bookkeeping with an explicit audit
+// action. "reconciled" follows a real backend write; "adopt" records a
+// side-effect-free adoption of live backend state that already matched.
+func (e *Engine) recordReadyAction(generation int64, d v1.Declaration, hash, action, msg string) {
 	r := &v1.Resource{
 		Kind:        d.Kind,
 		Name:        d.Name,
@@ -383,12 +453,23 @@ func (e *Engine) recordReady(generation int64, d v1.Declaration, hash string) {
 		}},
 	}
 	_ = e.store.Put(r)
-	e.audit(generation, d.Key(), "reconciled", v1.ReasonNone, "converged to desired state")
+	e.audit(generation, d.Key(), action, v1.ReasonNone, msg)
 }
 
 // markFailed persists a Failed phase for an apply attempt so retry/resume
-// (including after restart) can see and recover it.
-func (e *Engine) markFailed(generation int64, d v1.Declaration, re *v1.ReconcileError) {
+// (including after restart) can see and recover it. Crucially it never
+// rewrites the stored SpecHash to the un-reached desired hash: a failed
+// write must not be mistaken for satisfaction on the next pass. Existing
+// ownership is preserved when known.
+func (e *Engine) markFailed(generation int64, d v1.Declaration, existing *v1.Resource, re *v1.ReconcileError) {
+	owner := v1.ControllerOwner
+	if existing != nil && existing.Owner != "" {
+		owner = existing.Owner
+	}
+	storedHash := ""
+	if existing != nil {
+		storedHash = existing.SpecHash
+	}
 	r := &v1.Resource{
 		Kind:        d.Kind,
 		Name:        d.Name,
@@ -398,8 +479,8 @@ func (e *Engine) markFailed(generation int64, d v1.Declaration, re *v1.Reconcile
 		Annotations: cloneStringMap(d.Annotations),
 		Phase:       v1.PhaseFailed,
 		Generation:  generation,
-		SpecHash:    d.SpecHash(),
-		Owner:       v1.ControllerOwner,
+		SpecHash:    storedHash,
+		Owner:       owner,
 		Conditions:  []v1.Condition{rejectedCondition(re)},
 	}
 	_ = e.store.Put(r)
@@ -458,6 +539,38 @@ func shortHash(h string) string {
 		return h[:8]
 	}
 	return h
+}
+
+// phaseOf renders a possibly-nil stored resource's phase for logs.
+func phaseOf(r *v1.Resource) string {
+	if r == nil {
+		return "<absent>"
+	}
+	return string(r.Phase)
+}
+
+// hashOf renders a possibly-nil stored resource's hash for logs.
+func hashOf(r *v1.Resource) string {
+	if r == nil {
+		return ""
+	}
+	return r.SpecHash
+}
+
+// resourceFromDecl converts a live backend observation into a minimal
+// stored-style resource, used only as the base of an Update when local
+// bookkeeping has no record of an existing object.
+func resourceFromDecl(d v1.Declaration) *v1.Resource {
+	return &v1.Resource{
+		Kind:        d.Kind,
+		Name:        d.Name,
+		Version:     d.Version,
+		DependsOn:   append([]string(nil), d.DependsOn...),
+		Spec:        cloneStringMap(d.Spec),
+		Annotations: cloneStringMap(d.Annotations),
+		SpecHash:    d.SpecHash(),
+		Owner:       d.Annotations[v1.AnnotationOwner],
+	}
 }
 
 // dependencyBlocker returns a dependency that is not Ready (directly failed

@@ -45,6 +45,7 @@ func main() {
 	}
 
 	// Repeated triggers converge; the injected failure heals by the 3rd run.
+	var res *v1.ReconcileResult
 	for attempt := 1; attempt <= 3; attempt++ {
 		fmt.Printf("\n===== reconcile attempt %d (generation 1) =====\n", attempt)
 		res, err := eng.Reconcile(ctx, 1, desired)
@@ -55,9 +56,28 @@ func main() {
 
 	c, u, d := ap.Counts("Topic/events")
 	fmt.Printf("\nbackend side effects for Topic/events -> creates=%d updates=%d deletes=%d\n", c, u, d)
+
+	// --- live-truth scenario: an operator mutates the backend out of band,
+	// then the next reconcile must observe the drift and correct it once. ---
+	fmt.Println("\n===== external drift scenario =====")
+	drifted := desired[1]
+	drifted.Spec = map[string]string{"partitions": "99"}
+	ap.SeedWorld(drifted) // overwrite the backend object directly, no side effect
+	fmt.Println("operator changed Topic/events partitions 4 -> 99 directly in the backend")
+	res, err = eng.Reconcile(ctx, 1, desired)
+	must(err)
+	fmt.Printf("reconcile after external change -> applied=%v noop=%v failed=%d\n",
+		res.Applied, res.Noop, len(res.Failed))
+	res, err = eng.Reconcile(ctx, 1, desired)
+	must(err)
+	fmt.Printf("reconcile again (live state now matches) -> applied=%v noop=%v failed=%d\n",
+		res.Applied, res.Noop, len(res.Failed))
+	c, u, d = ap.Counts("Topic/events")
+	fmt.Printf("backend side effects for Topic/events -> creates=%d updates=%d deletes=%d\n", c, u, d)
+
 	fmt.Println("\n===== audit trail (last entries) =====")
 	audit := st.Audit()
-	start := len(audit) - 12
+	start := len(audit) - 16
 	if start < 0 {
 		start = 0
 	}

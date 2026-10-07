@@ -12,7 +12,7 @@ import (
 // FailRule conditionally injects a failure for a named resource/action.
 type FailRule struct {
 	Resource string // match by declaration/resource Key()
-	Action   string // "create" | "update" | "delete"; empty matches all
+	Action   string // "create" | "update" | "delete" | "get"; empty matches all
 	Times    int    // fail this many times, then succeed (-1 = always fail)
 	Err      error  // returned failure; defaults to a generic backend error
 }
@@ -51,12 +51,34 @@ func NewFake(apiVersion string) *FakeApplier {
 	}
 }
 
-// Exists reports whether the resource exists in the backend world.
+// Exists reports whether the resource exists in the backend world. It does
+// NOT model observation failures; tests that need a backend outage use Get.
 func (f *FakeApplier) Exists(key string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.world[key]
 	return ok
+}
+
+// Get returns the backend's live declaration for a resource. It honors
+// injected "get" failures (simulating an unreadable backend), in which case
+// it returns an error without revealing whether the object exists, so the
+// engine is forced to keep the resource un-satisfied rather than trusting
+// local state.
+func (f *FakeApplier) Get(ctx context.Context, key string) (v1.Declaration, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return v1.Declaration{}, false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.checkFailureLocked(key, "get"); err != nil {
+		return v1.Declaration{}, false, err
+	}
+	d, ok := f.world[key]
+	if !ok {
+		return v1.Declaration{}, false, nil
+	}
+	return cloneDecl(d), true, nil
 }
 
 // GetDeclaration returns the backend's current declaration for a resource.

@@ -30,6 +30,7 @@ const (
 	ReasonIncompatibleVersion  Reason = "IncompatibleVersion"
 	ReasonApplyFailed          Reason = "ApplyFailed"
 	ReasonDeleteFailed         Reason = "DeleteFailed"
+	ReasonBackendUnavailable   Reason = "BackendUnavailable"
 	ReasonStorageUnavailable   Reason = "StorageUnavailable"
 )
 
@@ -118,7 +119,7 @@ type AuditEvent struct {
 	Time       time.Time `json:"time"`
 	Generation int64     `json:"generation"`
 	Resource   string    `json:"resource,omitempty"`
-	Action     string    `json:"action"` // "validate" | "create" | "update" | "noop" | "delete" | "reject" | "commit"
+	Action     string    `json:"action"` // "validate" | "create" | "update" | "noop" | "delete" | "reject" | "commit" | "reconciled" | "adopt"
 	Reason     Reason    `json:"reason,omitempty"`
 	Message    string    `json:"message,omitempty"`
 }

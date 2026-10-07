@@ -20,9 +20,15 @@ type Applier interface {
 	// Delete removes the resource described by r.
 	Delete(ctx context.Context, r *v1.Resource) error
 	// Exists reports whether the resource currently exists in the backend.
-	// The engine uses this to distinguish a real no-op from a resource
-	// that must be (re)created after a failed attempt or a crash.
 	Exists(key string) bool
+	// Get returns the resource's current live state as observed in the
+	// backend, exactly as the backend holds it. The second return value is
+	// false when the object is absent (e.g. externally deleted); a non-nil
+	// error means the live state could not be observed at all (backend
+	// outage, timeout) and callers must NOT infer satisfaction from local
+	// state in that case. The engine treats the backend observation, not
+	// its durable store, as the source of truth.
+	Get(ctx context.Context, key string) (v1.Declaration, bool, error)
 	// APIVersion reports the backend API version, used for compatibility
 	// checks against AnnotationMinApplierVersion.
 	APIVersion() string
